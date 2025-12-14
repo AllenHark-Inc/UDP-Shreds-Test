@@ -7,7 +7,7 @@ edition = "2021"
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 
-# Solana types
+# Solana types for Entry deserialization
 solana-entry = "=2.2.1"
 solana-sdk = "=2.2.1"
 
@@ -17,7 +17,3 @@ bincode = "1.3"
 # Logging
 tracing = "0.1"
 tracing-subscriber = "0.3"
-
-# gRPC client using jito_protos
-jito-protos = { path = "jito_protos" }
-tonic = { version = "0.10", features = ["tls", "tls-roots", "tls-webpki-roots"] }

@@ -1,22 +1,17 @@
-//! Tiny Shreds Client - Pumpfun Token Detector
+//! Tiny Shreds UDP Client - Pumpfun Token Detector
 //!
-//! Connects to shredstream_proxy via gRPC and detects newly minted pumpfun tokens.
-//! Uses jito_protos for protocol decoding.
+//! Listens for UDP packets from shredstream_proxy and detects newly minted pumpfun tokens.
 
 use std::{
-    env,
+    collections::HashMap,
     str::FromStr,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
-use jito_protos::shredstream::{
-    shredstream_proxy_client::ShredstreamProxyClient,
-    SubscribeEntriesRequest,
-};
 use solana_entry::entry::Entry;
 use solana_sdk::pubkey::Pubkey;
-use tonic::{metadata::MetadataValue, transport::Endpoint, Request};
-use tracing::{info, warn, error};
+use tokio::net::UdpSocket;
+use tracing::{info, warn, error, debug};
 
 /// Pumpfun program ID
 const PUMPFUN_PROGRAM_ID: &str = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
@@ -24,17 +19,92 @@ const PUMPFUN_PROGRAM_ID: &str = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
 /// CREATE instruction discriminator
 const CREATE_DISC: [u8; 8] = [24, 30, 200, 40, 5, 28, 7, 119];
 
+/// Fragment header size
+const HEADER_SIZE: usize = 16;
+
+/// Magic bytes for fragmented messages
+const MAGIC: &[u8; 4] = b"SHRD";
+
+/// Fragment reassembler for handling multi-packet messages
+struct FragmentReassembler {
+    buffers: HashMap<u32, FragmentBuffer>,
+}
+
+struct FragmentBuffer {
+    total_fragments: u16,
+    total_size: u32,
+    received: HashMap<u16, Vec<u8>>,
+    created_at: Instant,
+}
+
+impl FragmentReassembler {
+    fn new() -> Self {
+        Self { buffers: HashMap::new() }
+    }
+
+    /// Process incoming packet, returns complete message if reassembly is done
+    fn process_packet(&mut self, data: &[u8]) -> Option<Vec<u8>> {
+        // Check if this is a fragmented message (starts with SHRD magic)
+        if data.len() >= HEADER_SIZE && &data[0..4] == MAGIC {
+            let message_id = u32::from_le_bytes(data[4..8].try_into().unwrap());
+            let fragment_index = u16::from_le_bytes(data[8..10].try_into().unwrap());
+            let total_fragments = u16::from_le_bytes(data[10..12].try_into().unwrap());
+            let total_size = u32::from_le_bytes(data[12..16].try_into().unwrap());
+            let fragment_data = data[HEADER_SIZE..].to_vec();
+
+            debug!(
+                "Fragment: msg_id={}, idx={}/{}, size={}",
+                message_id, fragment_index + 1, total_fragments, fragment_data.len()
+            );
+
+            let entry = self.buffers.entry(message_id).or_insert_with(|| FragmentBuffer {
+                total_fragments,
+                total_size,
+                received: HashMap::new(),
+                created_at: Instant::now(),
+            });
+
+            entry.received.insert(fragment_index, fragment_data);
+
+            // Check if complete
+            if entry.received.len() == total_fragments as usize {
+                let mut complete = Vec::with_capacity(total_size as usize);
+                for i in 0..total_fragments {
+                    if let Some(frag) = entry.received.get(&i) {
+                        complete.extend_from_slice(frag);
+                    }
+                }
+                self.buffers.remove(&message_id);
+                info!("Reassembled message: {} bytes from {} fragments", complete.len(), total_fragments);
+                return Some(complete);
+            }
+            None
+        } else {
+            // Non-fragmented message - return as-is
+            Some(data.to_vec())
+        }
+    }
+
+    /// Cleanup old incomplete buffers (call periodically)
+    fn cleanup_old(&mut self) {
+        let max_age = Duration::from_secs(10);
+        self.buffers.retain(|_, v| v.created_at.elapsed() < max_age);
+    }
+}
+
 /// Process entries and detect pumpfun token creates
-fn process_entries(slot: u64, data: &[u8], pumpfun_program_id: &Pubkey) -> usize {
+fn process_entries(data: &[u8], pumpfun_program_id: &Pubkey) -> usize {
     let entries: Vec<Entry> = match bincode::deserialize(data) {
         Ok(e) => e,
         Err(e) => {
-            warn!("Slot {}: Failed to deserialize entries: {}", slot, e);
+            warn!("Failed to deserialize entries: {}", e);
             return 0;
         }
     };
 
     let total_txs: usize = entries.iter().map(|e| e.transactions.len()).sum();
+    debug!("Processing {} entries with {} transactions", entries.len(), total_txs);
+    
     let mut creates_found = 0;
 
     for entry in &entries {
@@ -61,21 +131,17 @@ fn process_entries(slot: u64, data: &[u8], pumpfun_program_id: &Pubkey) -> usize
                 if data[0..8] == CREATE_DISC {
                     creates_found += 1;
                     
-                    // Extract account pubkeys
                     let ix_accounts: Vec<Pubkey> = ix.accounts
                         .iter()
                         .filter_map(|&idx| accounts.get(idx as usize).copied())
                         .collect();
 
-                    // Account indices for pumpfun CREATE:
-                    // 0: mint, 1: mint_authority, 2: bonding_curve, 3: associated_bonding_curve,
-                    // 4: global, 5: mpl_token_metadata, 6: metadata, 7: user (creator)
-                    
+                    // 0: mint, 2: bonding_curve, 7: creator
                     let mint = ix_accounts.get(0).map(|p| p.to_string()).unwrap_or_default();
                     let bonding_curve = ix_accounts.get(2).map(|p| p.to_string()).unwrap_or_default();
                     let creator = ix_accounts.get(7).map(|p| p.to_string()).unwrap_or_default();
 
-                    info!("🚀 PUMPFUN TOKEN DETECTED @ Slot {}!", slot);
+                    info!("🚀 PUMPFUN TOKEN DETECTED!");
                     info!("   Mint: {}", mint);
                     info!("   Bonding Curve: {}", bonding_curve);
                     info!("   Creator: {}", creator);
@@ -89,107 +155,64 @@ fn process_entries(slot: u64, data: &[u8], pumpfun_program_id: &Pubkey) -> usize
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize logging
     tracing_subscriber::fmt::init();
 
-    // Configuration
-    let shredstream_uri = env::var("SHREDSTREAM_URI")
-        .unwrap_or_else(|_| "http://127.0.0.1:9001".to_string());
-    let x_token = env::var("X_TOKEN").ok();
-    
+    let bind_addr = std::env::var("UDP_BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:9001".to_string());
     let pumpfun_program_id = Pubkey::from_str(PUMPFUN_PROGRAM_ID)?;
 
     info!("===========================================");
-    info!("  Tiny Shreds Client - Pumpfun Detector");
+    info!("  Tiny Shreds UDP Client - Pumpfun Detector");
     info!("===========================================");
-    info!("Connecting to: {}", shredstream_uri);
+    info!("Listening on: {}", bind_addr);
     info!("Pumpfun Program: {}", pumpfun_program_id);
-    info!("X-Token: {}", if x_token.is_some() { "set" } else { "not set" });
     info!("");
+
+    let socket = UdpSocket::bind(&bind_addr).await?;
+    info!("✅ UDP socket bound successfully!");
+    info!("Waiting for packets from shredstream_proxy...");
+    info!("");
+
+    let mut reassembler = FragmentReassembler::new();
+    let mut buf = vec![0u8; 65536];
+    
+    let mut packets_received = 0u64;
+    let mut bytes_received = 0u64;
+    let mut creates_total = 0usize;
+    let mut last_stats = Instant::now();
+    let mut last_cleanup = Instant::now();
 
     loop {
-        match connect_and_stream(&shredstream_uri, x_token.as_deref(), &pumpfun_program_id).await {
-            Ok(_) => {
-                info!("Stream ended. Reconnecting in 1s...");
-            }
-            Err(e) => {
-                error!("Connection error: {}. Reconnecting in 1s...", e);
-            }
+        let (len, src) = socket.recv_from(&mut buf).await?;
+        packets_received += 1;
+        bytes_received += len as u64;
+
+        if packets_received == 1 {
+            info!("🎉 First packet from {}! ({} bytes)", src, len);
         }
-        tokio::time::sleep(Duration::from_secs(1)).await;
-    }
-}
 
-async fn connect_and_stream(
-    endpoint: &str,
-    x_token: Option<&str>,
-    pumpfun_program_id: &Pubkey,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let endpoint = Endpoint::from_str(endpoint)?
-        .keep_alive_while_idle(true)
-        .http2_keep_alive_interval(Duration::from_secs(5))
-        .keep_alive_timeout(Duration::from_secs(10))
-        .tcp_keepalive(Some(Duration::from_secs(15)))
-        .connect_timeout(Duration::from_secs(5));
+        // Cleanup old fragments every 5 seconds
+        if last_cleanup.elapsed() >= Duration::from_secs(5) {
+            reassembler.cleanup_old();
+            last_cleanup = Instant::now();
+        }
 
-    let channel = endpoint.connect().await?;
-    let mut client = ShredstreamProxyClient::new(channel);
+        // Process packet through reassembler
+        if let Some(complete_data) = reassembler.process_packet(&buf[..len]) {
+            creates_total += process_entries(&complete_data, &pumpfun_program_id);
+        }
 
-    let mut request = Request::new(SubscribeEntriesRequest {});
-    
-    // Add auth token if provided
-    if let Some(token) = x_token {
-        let metadata_value = MetadataValue::from_str(token)?;
-        request.metadata_mut().insert("x-token", metadata_value);
-    }
-
-    let mut stream = client.subscribe_entries(request).await?.into_inner();
-    
-    info!("✅ Connected to shredstream!");
-    info!("Waiting for entries...");
-    info!("");
-
-    let mut entry_count = 0u64;
-    let mut bytes_total = 0u64;
-    let mut creates_total = 0usize;
-    let mut last_stats = std::time::Instant::now();
-
-    while let Some(result) = stream.message().await.transpose() {
-        match result {
-            Ok(entry) => {
-                entry_count += 1;
-                let slot = entry.slot;
-                let data = entry.entries;
-                bytes_total += data.len() as u64;
-
-                if entry_count == 1 {
-                    info!("🎉 First entry! Slot: {}, Size: {} bytes", slot, data.len());
-                }
-
-                // Process entries and look for pumpfun creates
-                let creates = process_entries(slot, &data, pumpfun_program_id);
-                creates_total += creates;
-
-                // Log stats every 15 seconds
-                if last_stats.elapsed() >= Duration::from_secs(15) {
-                    info!(
-                        "📊 Stats: {} entries, {:.2} MB, {} pumpfun creates",
-                        entry_count,
-                        bytes_total as f64 / 1_000_000.0,
-                        creates_total
-                    );
-                    entry_count = 0;
-                    bytes_total = 0;
-                    creates_total = 0;
-                    last_stats = std::time::Instant::now();
-                }
-            }
-            Err(e) => {
-                error!("Stream error: {:?}", e);
-                return Err(Box::new(e));
-            }
+        // Log stats every 15 seconds
+        if last_stats.elapsed() >= Duration::from_secs(15) {
+            info!(
+                "📊 {} packets, {:.2} MB, {} pumpfun creates",
+                packets_received,
+                bytes_received as f64 / 1_000_000.0,
+                creates_total
+            );
+            packets_received = 0;
+            bytes_received = 0;
+            creates_total = 0;
+            last_stats = Instant::now();
         }
     }
-
-    Ok(())
 }
