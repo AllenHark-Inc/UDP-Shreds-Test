@@ -93,17 +93,21 @@ impl FragmentReassembler {
 }
 
 /// Process entries and detect pumpfun token creates
-fn process_entries(data: &[u8], pumpfun_program_id: &Pubkey) -> usize {
+/// Returns (creates_found, entries_count, tx_count)
+fn process_entries(data: &[u8], pumpfun_program_id: &Pubkey, msg_seq: u64) -> (usize, usize, usize) {
     let entries: Vec<Entry> = match bincode::deserialize(data) {
         Ok(e) => e,
         Err(e) => {
             warn!("Failed to deserialize entries: {}", e);
-            return 0;
+            return (0, 0, 0);
         }
     };
 
+    let entries_count = entries.len();
     let total_txs: usize = entries.iter().map(|e| e.transactions.len()).sum();
-    debug!("Processing {} entries with {} transactions", entries.len(), total_txs);
+    
+    // Log each message's stats
+    info!("📦 Msg #{}: {} entries, {} txs", msg_seq, entries_count, total_txs);
     
     let mut creates_found = 0;
 
@@ -136,21 +140,24 @@ fn process_entries(data: &[u8], pumpfun_program_id: &Pubkey) -> usize {
                         .filter_map(|&idx| accounts.get(idx as usize).copied())
                         .collect();
 
-                    // 0: mint, 2: bonding_curve, 7: creator
-                    let mint = ix_accounts.get(0).map(|p| p.to_string()).unwrap_or_default();
+                    // 0: mint (token address), 2: bonding_curve, 7: creator
+                    let token_address = ix_accounts.get(0).map(|p| p.to_string()).unwrap_or_default();
                     let bonding_curve = ix_accounts.get(2).map(|p| p.to_string()).unwrap_or_default();
                     let creator = ix_accounts.get(7).map(|p| p.to_string()).unwrap_or_default();
 
-                    info!("🚀 PUMPFUN TOKEN DETECTED!");
-                    info!("   Mint: {}", mint);
+                    info!("═══════════════════════════════════════════════════════");
+                    info!("🚀 PUMPFUN TOKEN FOUND!");
+                    info!("   Token Address: {}", token_address);
                     info!("   Bonding Curve: {}", bonding_curve);
                     info!("   Creator: {}", creator);
+                    info!("   Message: #{}, Entries: {}, Txs: {}", msg_seq, entries_count, total_txs);
+                    info!("═══════════════════════════════════════════════════════");
                 }
             }
         }
     }
 
-    creates_found
+    (creates_found, entries_count, total_txs)
 }
 
 #[tokio::main]
@@ -178,6 +185,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut packets_received = 0u64;
     let mut bytes_received = 0u64;
     let mut creates_total = 0usize;
+    let mut entries_total = 0usize;
+    let mut txs_total = 0usize;
+    let mut msg_seq = 0u64;
     let mut last_stats = Instant::now();
     let mut last_cleanup = Instant::now();
 
@@ -198,20 +208,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // Process packet through reassembler
         if let Some(complete_data) = reassembler.process_packet(&buf[..len]) {
-            creates_total += process_entries(&complete_data, &pumpfun_program_id);
+            msg_seq += 1;
+            let (creates, entries, txs) = process_entries(&complete_data, &pumpfun_program_id, msg_seq);
+            creates_total += creates;
+            entries_total += entries;
+            txs_total += txs;
         }
 
         // Log stats every 15 seconds
         if last_stats.elapsed() >= Duration::from_secs(15) {
             info!(
-                "📊 {} packets, {:.2} MB, {} pumpfun creates",
+                "📊 Stats: {} pkts, {:.2} MB, {} msgs, {} entries, {} txs, {} creates",
                 packets_received,
                 bytes_received as f64 / 1_000_000.0,
+                msg_seq,
+                entries_total,
+                txs_total,
                 creates_total
             );
             packets_received = 0;
             bytes_received = 0;
             creates_total = 0;
+            entries_total = 0;
+            txs_total = 0;
             last_stats = Instant::now();
         }
     }
