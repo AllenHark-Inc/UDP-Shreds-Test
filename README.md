@@ -1,6 +1,12 @@
 # Shreds UDP Client - Pumpfun Token Detector
 
-A lightweight Rust client that listens for Solana shred data via UDP and detects newly minted Pumpfun tokens in real-time.
+A lightweight Rust UDP client that listens for Solana shred data and detects newly minted Pumpfun tokens in real-time.
+
+This is an example implementation that can be compiled and customized for your own use case.
+
+**Links:**
+- 🌐 Website: [allenhark.com](https://allenhark.com)
+- 💬 Discord: [Join our community](https://discord.gg/JpzS72MAKG)
 
 ## Features
 
