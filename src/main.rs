@@ -94,7 +94,7 @@ impl FragmentReassembler {
 
 /// Process entries and detect pumpfun token creates
 /// Returns (creates_found, entries_count, tx_count)
-fn process_entries(data: &[u8], pumpfun_program_id: &Pubkey, msg_seq: u64) -> (usize, usize, usize) {
+fn process_entries(data: &[u8], pumpfun_program_id: &Pubkey, msg_seq: u64, slot: u64) -> (usize, usize, usize) {
     let entries: Vec<Entry> = match bincode::deserialize(data) {
         Ok(e) => e,
         Err(e) => {
@@ -107,7 +107,7 @@ fn process_entries(data: &[u8], pumpfun_program_id: &Pubkey, msg_seq: u64) -> (u
     let total_txs: usize = entries.iter().map(|e| e.transactions.len()).sum();
     
     // Log each message's stats
-    info!("📦 Msg #{}: {} entries, {} txs", msg_seq, entries_count, total_txs);
+    info!("📦 Msg #{} [Slot {}]: {} entries, {} txs", msg_seq, slot, entries_count, total_txs);
     
     let mut creates_found = 0;
 
@@ -150,7 +150,7 @@ fn process_entries(data: &[u8], pumpfun_program_id: &Pubkey, msg_seq: u64) -> (u
                     info!("   Token Address: {}", token_address);
                     info!("   Bonding Curve: {}", bonding_curve);
                     info!("   Creator: {}", creator);
-                    info!("   Message: #{}, Entries: {}, Txs: {}", msg_seq, entries_count, total_txs);
+                    info!("   Message: #{} [Slot {}], Entries: {}, Txs: {}", msg_seq, slot, entries_count, total_txs);
                     info!("═══════════════════════════════════════════════════════");
                 }
             }
@@ -163,7 +163,7 @@ fn process_entries(data: &[u8], pumpfun_program_id: &Pubkey, msg_seq: u64) -> (u
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
-
+    
     let bind_addr = std::env::var("UDP_BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:9001".to_string());
     let pumpfun_program_id = Pubkey::from_str(PUMPFUN_PROGRAM_ID)?;
 
@@ -171,6 +171,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("  Tiny Shreds UDP Client - Pumpfun Detector");
     info!("===========================================");
     info!("Listening on: {}", bind_addr);
+    info!("Format: Slot Prefixed (Strict)");
     info!("Pumpfun Program: {}", pumpfun_program_id);
     info!("");
 
@@ -190,6 +191,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut msg_seq = 0u64;
     let mut last_stats = Instant::now();
     let mut last_cleanup = Instant::now();
+    let mut current_slot = 0u64;
 
     loop {
         let (len, src) = socket.recv_from(&mut buf).await?;
@@ -206,10 +208,46 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             last_cleanup = Instant::now();
         }
 
-        // Process packet through reassembler
-        if let Some(complete_data) = reassembler.process_packet(&buf[..len]) {
+        // Verify minimum size
+        if len < 8 {
+            warn!("Received packet too small (< 8 bytes) from {}", src);
+            continue;
+        }
+
+        // Check if this is a fragmented packet (starts with SHRD magic)
+        let is_fragment = len >= HEADER_SIZE && &buf[0..4] == MAGIC;
+        
+        if is_fragment {
+            // Fragmented packet: [SHRD:16][chunk of (slot:8 + data)]
+            // Pass the ENTIRE packet to reassembler (including SHRD header)
+            if let Some(complete_data) = reassembler.process_packet(&buf[..len]) {
+                // Reassembled data is slot_prefixed: [slot:8][entries]
+                if complete_data.len() >= 8 {
+                    let slot = u64::from_le_bytes(complete_data[0..8].try_into().unwrap());
+                    if slot > current_slot {
+                        current_slot = slot;
+                    }
+                    
+                    msg_seq += 1;
+                    let entries_data = &complete_data[8..];
+                    let (creates, entries, txs) = process_entries(entries_data, &pumpfun_program_id, msg_seq, current_slot);
+                    creates_total += creates;
+                    entries_total += entries;
+                    txs_total += txs;
+                }
+            }
+        } else {
+            // Non-fragmented packet: [slot:8][entries]
+            let slot = u64::from_le_bytes(buf[0..8].try_into().unwrap());
+            if slot > current_slot {
+                current_slot = slot;
+            }
+            
+            let payload = &buf[8..len];
+            
+            // For non-fragmented, payload goes directly to processing (no reassembly needed)
             msg_seq += 1;
-            let (creates, entries, txs) = process_entries(&complete_data, &pumpfun_program_id, msg_seq);
+            let (creates, entries, txs) = process_entries(payload, &pumpfun_program_id, msg_seq, current_slot);
             creates_total += creates;
             entries_total += entries;
             txs_total += txs;
@@ -218,7 +256,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Log stats every 15 seconds
         if last_stats.elapsed() >= Duration::from_secs(15) {
             info!(
-                "📊 Stats: {} pkts, {:.2} MB, {} msgs, {} entries, {} txs, {} creates",
+                "📊 Stats [Slot {}]: {} pkts, {:.2} MB, {} msgs, {} entries, {} txs, {} creates",
+                current_slot,
                 packets_received,
                 bytes_received as f64 / 1_000_000.0,
                 msg_seq,

@@ -64,13 +64,13 @@ When a Pumpfun token is detected:
 ```
 
 ## Data Format
+The client requires the **Slot Prefixed** packet format (configured in your target settings).
 
-The client expects UDP packets containing:
+### Slot Prefixed Format
+Preprends the slot number to the packet.
+- **Structure**: `[u64 slot (8 bytes)][Shred Packet Data...]`
 
-1. **Single packets**: Raw bincode-serialized `Vec<solana_entry::entry::Entry>`
-2. **Fragmented packets**: 16-byte header (`SHRD` magic + metadata) followed by payload chunk
-
-Fragment header format:
+Fragment header format (inside the payload options):
 - Bytes 0-3: Magic `SHRD`
 - Bytes 4-7: Message ID (u32 LE)
 - Bytes 8-9: Fragment index (u16 LE)
